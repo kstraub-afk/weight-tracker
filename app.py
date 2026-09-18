@@ -80,50 +80,52 @@ with tab_weight:
         df_calc = df_calc.sort_values("date").reset_index(drop=True)
 
         latest_wt = df_calc.iloc[-1]["weight"]
-        start_wt = df_calc.iloc[0]["weight"]
-        total_diff = latest_wt - start_wt
 
-        # Kalenderwochen berechnen
+        # Kalenderwochen aufbereiten
         df_calc["KW"] = df_calc["date"].dt.isocalendar().week
         df_calc["Year"] = df_calc["date"].dt.isocalendar().year
 
-        # Wöchentlicher Durchschnitt (aktuelle KW)
-        latest_year = df_calc.iloc[-1]["Year"]
-        latest_kw = df_calc.iloc[-1]["KW"]
-        current_kw_rows = df_calc[(df_calc["Year"] == latest_year) & (df_calc["KW"] == latest_kw)]
-        current_weekly_avg = current_kw_rows["weight"].mean()
+        # Wöchentliche Durchschnitte aggregieren
+        kw_grouped = df_calc.groupby(["Year", "KW"])["weight"].mean().reset_index().sort_values(["Year", "KW"])
+        current_weekly_avg = kw_grouped.iloc[-1]["weight"]
 
-        # Monatliche Zuwachsberechnung (letzte 30 Tage)
-        one_month_ago = df_calc.iloc[-1]["date"] - timedelta(days=30)
-        past_month_entries = df_calc[df_calc["date"] <= one_month_ago]
-        if not past_month_entries.empty:
-            month_baseline = past_month_entries.iloc[-1]["weight"]
-            monthly_diff_kg = latest_wt - month_baseline
-            monthly_diff_pct = (monthly_diff_kg / month_baseline) * 100
+        # 4-Wochen Durchschnitts-Vergleich
+        if len(kw_grouped) >= 5:
+            baseline_kw_avg = kw_grouped.iloc[-5]["weight"]
+            monthly_diff_kg = current_weekly_avg - baseline_kw_avg
+            monthly_diff_pct = (monthly_diff_kg / baseline_kw_avg) * 100
+        elif len(kw_grouped) > 1:
+            baseline_kw_avg = kw_grouped.iloc[0]["weight"]
+            monthly_diff_kg = current_weekly_avg - baseline_kw_avg
+            monthly_diff_pct = (monthly_diff_kg / baseline_kw_avg) * 100
         else:
-            monthly_diff_kg = total_diff
-            monthly_diff_pct = (total_diff / start_wt) * 100 if start_wt else 0.0
+            monthly_diff_kg = 0.0
+            monthly_diff_pct = 0.0
 
         st.markdown("---")
 
         # TOGGLE: % vs. absolute (kg)
         gain_format = st.radio("Monthly Gain Display", ["Absolute (kg)", "Percentage (%)"], horizontal=True)
 
-        # METRICS: Current Weight (links) | Weekly Average (mitte) | Monthly Gain mit "i" (rechts)
+        # METRICS: Current Weight (links) | Weekly Average mit "i" (mitte) | Monthly Gain mit "i" (rechts)
         m1, m2, m3 = st.columns(3)
         m1.metric("Current Weight", f"{latest_wt:.1f} kg")
-        m2.metric("Weekly Average", f"{current_weekly_avg:.2f} kg")
+        m2.metric(
+            "Weekly Average", 
+            f"{current_weekly_avg:.2f} kg",
+            help="Average morning weight for the current calendar week. Filters out daily water and sodium fluctuations."
+        )
         if gain_format == "Absolute (kg)":
             m3.metric(
                 "Monthly Gain", 
                 f"{monthly_diff_kg:+.2f} kg",
-                help="Target: 1.0% - 2.0% body weight gain per month for a lean bulk."
+                help="Calculated as (Current KW Avg - KW Avg 4 Weeks Prior). Target: 1.0% - 2.0% body weight gain per month for a lean bulk."
             )
         else:
             m3.metric(
                 "Monthly Gain", 
                 f"{monthly_diff_pct:+.2f} %",
-                help="Target: 1.0% - 2.0% body weight gain per month for a lean bulk."
+                help="Calculated as ((Current KW Avg - KW Avg 4 Weeks Prior) / KW Avg 4 Weeks Prior) * 100. Target: 1.0% - 2.0% body weight gain per month for a lean bulk."
             )
 
         st.markdown("---")
