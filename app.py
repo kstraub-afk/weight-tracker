@@ -1,249 +1,363 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
-from datetime import date
+from datetime import date, datetime, timedelta
 from streamlit_gsheets import GSheetsConnection
 
-st.set_page_config(page_title="Weight Tracker", page_icon="⚖️", layout="centered")
+# ----------------------------------------------------
+# PAGE CONFIG & CUSTOM STYLES
+# ----------------------------------------------------
+st.set_page_config(page_title="Fitness Hub", page_icon="⚡", layout="centered")
 
-# --- Custom Styling Polish ---
 st.markdown("""
 <style>
-    div[data-testid="stMetricValue"] {
-        font-size: 1.85rem !important;
-        font-weight: 700 !important;
-    }
-    div[data-testid="stMetricLabel"] {
-        font-weight: 600 !important;
-        font-size: 0.95rem !important;
-    }
-    div[data-testid="stForm"] {
-        border-radius: 12px;
-        padding: 1.25rem;
+    .history-card {
+        background-color: #f3f4f6;
+        border-left: 4px solid #6b7280;
+        padding: 10px 14px;
+        border-radius: 6px;
+        margin-bottom: 12px;
+        font-size: 13px;
+        color: #374151;
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚖️ Daily Weight Tracker")
-
-# 1. Google Sheets Connection
+# ----------------------------------------------------
+# GSHEETS CONNECTION & DATA HELPERS
+# ----------------------------------------------------
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-def load_data() -> pd.DataFrame:
+def load_data(worksheet_name, default_cols):
     try:
-        data = conn.read(ttl=0)
-        if data is None or data.empty:
-            return pd.DataFrame(columns=["date", "weight"])
-        data = data.dropna(subset=["date", "weight"]).copy()
-        data["date"] = pd.to_datetime(data["date"])
-        data["weight"] = pd.to_numeric(data["weight"])
-        return data.sort_values("date").reset_index(drop=True)
+        df = conn.read(worksheet=worksheet_name, ttl=0)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=default_cols)
+        df = df.dropna(how="all")
+        for col in default_cols:
+            if col not in df.columns:
+                df[col] = None
+        return df
     except Exception:
-        return pd.DataFrame(columns=["date", "weight"])
+        return pd.DataFrame(columns=default_cols)
 
-df = load_data()
+df_weights = load_data("weights", ["date", "weight"])
+df_workouts = load_data("workouts", ["date", "split_type", "completed"])
+df_exercises = load_data("exercise_logs", ["date", "exercise", "set_number", "weight_kg", "reps", "notes"])
 
-# 2. Daily Input Card
-with st.container(border=True):
-    st.subheader("Log Weight Entry", divider="gray")
-    with st.form("weight_entry_form", clear_on_submit=True, border=False):
-        c_date, c_weight = st.columns(2)
-        with c_date:
-            entry_date = st.date_input("Date", value=date.today())
-        with c_weight:
-            default_val = float(df.iloc[-1]["weight"]) if not df.empty else 80.0
-            weight_val = st.number_input(
-                "Morning Weight (kg)",
-                min_value=30.0,
-                max_value=250.0,
-                value=default_val,
-                step=0.1,
-                format="%.1f"
-            )
-        
-        submitted = st.form_submit_button("Record Weight", use_container_width=True, type="primary")
+# ----------------------------------------------------
+# NAVIGATION TABS
+# ----------------------------------------------------
+tab_weight, tab_gym = st.tabs(["⚖️ Daily Weight Tracker", "🏋️ Gym & Workout Log"])
 
-        if submitted:
-            entry_ts = pd.to_datetime(entry_date)
+# ====================================================
+# TAB 1: WEIGHT TRACKER
+# ====================================================
+with tab_weight:
+    st.title("⚖️ Daily Weight Tracker")
 
-            if not df.empty and entry_ts in df["date"].values:
-                df.loc[df["date"] == entry_ts, "weight"] = float(weight_val)
-            else:
-                new_row = pd.DataFrame([{"date": entry_ts, "weight": float(weight_val)}])
-                df = pd.concat([df, new_row], ignore_index=True)
+    with st.form("weight_form", clear_on_submit=False):
+        col_d, col_w = st.columns(2)
+        with col_d:
+            w_date = st.date_input("Date", date.today(), key="original_w_date")
+        with col_w:
+            w_val = st.number_input("Morning Weight (kg)", min_value=40.0, max_value=150.0, value=80.0, step=0.1, format="%.1f")
+        submit_weight = st.form_submit_button("Record Weight", use_container_width=True)
 
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
-
-            upload_df = df.copy()
-            upload_df["date"] = upload_df["date"].dt.strftime("%Y-%m-%d")
-
-            conn.update(data=upload_df)
-            st.toast(f"Logged {weight_val:.1f} kg for {str(entry_date)}", icon="✅")
+        if submit_weight:
+            date_str = w_date.strftime("%Y-%m-%d")
+            df_weights_clean = df_weights[df_weights["date"] != date_str].copy()
+            new_entry = pd.DataFrame([{"date": date_str, "weight": float(w_val)}])
+            updated_weights = pd.concat([df_weights_clean, new_entry], ignore_index=True)
+            conn.update(worksheet="weights", data=updated_weights)
+            st.success(f"Recorded {w_val} kg for {date_str}!")
             st.rerun()
 
-# 3. Dashboard View
-if not df.empty:
-    # Calculations
-    df["iso_year"] = df["date"].dt.isocalendar().year
-    df["iso_week"] = df["date"].dt.isocalendar().week
-    df["kw_label"] = df.apply(lambda r: f"KW {r['iso_week']:02d}", axis=1)
+    if not df_weights.empty:
+        df_calc = df_weights.copy()
+        df_calc["date"] = pd.to_datetime(df_calc["date"])
+        df_calc["weight"] = pd.to_numeric(df_calc["weight"])
+        df_calc = df_calc.sort_values("date").reset_index(drop=True)
 
-    weekly_agg = (
-        df.groupby(["iso_year", "iso_week", "kw_label"], as_index=False)
-        .agg(avg_weight=("weight", "mean"), count=("weight", "count"))
-        .sort_values(["iso_year", "iso_week"])
-        .reset_index(drop=True)
-    )
+        latest_wt = df_calc.iloc[-1]["weight"]
+        start_wt = df_calc.iloc[0]["weight"]
+        total_diff = latest_wt - start_wt
 
-    latest_weight = df.iloc[-1]["weight"]
-    latest_kw_avg = weekly_agg.iloc[-1]["avg_weight"]
-    current_kw_label = weekly_agg.iloc[-1]["kw_label"]
+        # Kalenderwochen berechnen
+        df_calc["KW"] = df_calc["date"].dt.isocalendar().week
+        df_calc["Year"] = df_calc["date"].dt.isocalendar().year
 
-    if len(weekly_agg) >= 5:
-        base_kw_row = weekly_agg.iloc[-5]
-    elif len(weekly_agg) > 1:
-        base_kw_row = weekly_agg.iloc[0]
-    else:
-        base_kw_row = None
+        # Wöchentlicher Durchschnitt (aktuelle KW)
+        latest_year = df_calc.iloc[-1]["Year"]
+        latest_kw = df_calc.iloc[-1]["KW"]
+        current_kw_rows = df_calc[(df_calc["Year"] == latest_year) & (df_calc["KW"] == latest_kw)]
+        current_weekly_avg = current_kw_rows["weight"].mean()
 
-    bulk_help = (
-        "Optimal lean bulk rate: ~1.0% to 2.0% body weight increase per month "
-        "to maximize muscle accretion while limiting fat gain. "
-        "Calculated by comparing the current weekly average with the baseline week."
-    )
-
-    # Overview Metrics Card
-    with st.container(border=True):
-        head_col1, head_col2 = st.columns([2, 1])
-        with head_col1:
-            st.subheader("Performance Overview")
-        with head_col2:
-            metric_unit = st.segmented_control(
-                "Metric Unit",
-                options=["%", "kg"],
-                default="%",
-                label_visibility="collapsed"
-            )
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Latest Log", f"{latest_weight:.1f} kg")
-        col2.metric(f"Current {current_kw_label}", f"{latest_kw_avg:.2f} kg")
-
-        if base_kw_row is not None and base_kw_row["avg_weight"] > 0:
-            base_avg = base_kw_row["avg_weight"]
-            delta_abs = latest_kw_avg - base_avg
-            delta_pct = (delta_abs / base_avg) * 100.0
-            kw_distance = (len(weekly_agg) - 1) if len(weekly_agg) < 5 else 4
-            delta_label = f"Monthly Gain ({kw_distance}w)"
-
-            if metric_unit == "%":
-                col3.metric(
-                    label=delta_label,
-                    value=f"{delta_pct:+.2f}%",
-                    delta=f"{delta_abs:+.2f} kg (Target: +1.0% to +2.0%)",
-                    help=bulk_help
-                )
-            else:
-                col3.metric(
-                    label=delta_label,
-                    value=f"{delta_abs:+.2f} kg",
-                    delta=f"{delta_pct:+.2f}% (Target: +1.0% to +2.0%)",
-                    help=bulk_help
-                )
+        # Monatliche Zuwachsberechnung (letzte 30 Tage)
+        one_month_ago = df_calc.iloc[-1]["date"] - timedelta(days=30)
+        past_month_entries = df_calc[df_calc["date"] <= one_month_ago]
+        if not past_month_entries.empty:
+            month_baseline = past_month_entries.iloc[-1]["weight"]
+            monthly_diff_kg = latest_wt - month_baseline
+            monthly_diff_pct = (monthly_diff_kg / month_baseline) * 100
         else:
-            col3.metric(
-                label="Monthly Gain",
-                value="N/A",
-                delta="Need ≥ 2 weeks",
-                help=bulk_help
-            )
+            monthly_diff_kg = total_diff
+            monthly_diff_pct = (total_diff / start_wt) * 100 if start_wt else 0.0
 
-    # Weekly Summary Table Card
-    with st.container(border=True):
-        st.subheader("Kalenderwochen Historie")
-        kw_table = weekly_agg[["kw_label", "avg_weight"]].copy()
-        kw_table["avg_weight"] = kw_table["avg_weight"].round(2).map("{:.2f} kg".format)
-        kw_display = kw_table.set_index("kw_label").T
-        kw_display.index = ["Ø Schnitt"]
-        st.dataframe(kw_display, use_container_width=True)
+        st.markdown("---")
 
-    # Visual Chart Card
-    with st.container(border=True):
-        view_col1, view_col2 = st.columns([1.5, 2.5])
-        with view_col1:
-            st.subheader("Visual Trajectory")
-        with view_col2:
-            view_mode = st.radio(
-                "Select Resolution:",
-                options=["Täglich (Daily View)", "Kalenderwoche (Weekly Average)"],
-                horizontal=True,
-                label_visibility="collapsed"
-            )
+        # TOGGLE: % vs. absolute (kg)
+        gain_format = st.radio("Monthly Gain Display", ["Absolute (kg)", "Percentage (%)"], horizontal=True)
 
-        y_axis_config = alt.Y(
-            "weight:Q",
-            scale=alt.Scale(domain=[77, 85], clamp=False),
-            axis=alt.Axis(
-                values=list(range(77, 86)),
-                title="Weight (kg)",
-                format=".0f",
-                grid=True,
-                gridDash=[2, 2]
-            )
-        )
-
-        if view_mode == "Täglich (Daily View)":
-            chart_data = df[["date", "weight"]].copy()
-            chart_data["DisplayDate"] = chart_data["date"].dt.strftime("%Y-%m-%d")
-
-            chart = (
-                alt.Chart(chart_data)
-                .mark_line(
-                    point=alt.OverlayMarkDef(filled=True, size=65, stroke="white", strokeWidth=1.5),
-                    strokeWidth=3,
-                    interpolate="monotone",
-                    color="#2563EB"
-                )
-                .encode(
-                    x=alt.X("DisplayDate:N", title="Datum", sort=None),
-                    y=y_axis_config,
-                    tooltip=[
-                        alt.Tooltip("DisplayDate:N", title="Date"),
-                        alt.Tooltip("weight:Q", format=".1f", title="Weight (kg)")
-                    ]
-                )
-                .properties(height=360)
+        # METRICS: Current Weight (links) | Weekly Average (mitte) | Monthly Gain mit "i" (rechts)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Current Weight", f"{latest_wt:.1f} kg")
+        m2.metric("Weekly Average", f"{current_weekly_avg:.2f} kg")
+        if gain_format == "Absolute (kg)":
+            m3.metric(
+                "Monthly Gain", 
+                f"{monthly_diff_kg:+.2f} kg",
+                help="Target: 1.0% - 2.0% body weight gain per month for a lean bulk."
             )
         else:
-            chart_data = weekly_agg.rename(columns={"avg_weight": "weight"}).copy()
-
-            chart = (
-                alt.Chart(chart_data)
-                .mark_line(
-                    point=alt.OverlayMarkDef(filled=True, size=75, stroke="white", strokeWidth=1.5),
-                    strokeWidth=3,
-                    interpolate="monotone",
-                    color="#D97706"
-                )
-                .encode(
-                    x=alt.X("kw_label:N", title="Kalenderwoche", sort=None),
-                    y=y_axis_config,
-                    tooltip=[
-                        alt.Tooltip("kw_label:N", title="Week"),
-                        alt.Tooltip("weight:Q", format=".2f", title="Ø Weight (kg)"),
-                        alt.Tooltip("count:Q", title="Days Logged")
-                    ]
-                )
-                .properties(height=360)
+            m3.metric(
+                "Monthly Gain", 
+                f"{monthly_diff_pct:+.2f} %",
+                help="Target: 1.0% - 2.0% body weight gain per month for a lean bulk."
             )
+
+        st.markdown("---")
+        st.subheader("Weight Progression Chart")
+
+        # TOGGLE: Daily vs. Calendar Weeks
+        chart_view = st.radio("Chart Resolution", ["Daily", "Calendar Weeks (KW Average)"], horizontal=True)
+
+        if chart_view == "Daily":
+            chart = alt.Chart(df_calc).mark_line(point=True, color="#e04848").encode(
+                x=alt.X("date:T", title="Date", axis=alt.Axis(format="%d %b")),
+                y=alt.Y("weight:Q", scale=alt.Scale(domain=[76, 83]), title="Weight (kg)"),
+                tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), alt.Tooltip("weight:Q", format=".2f")]
+            ).properties(height=320)
+        else:
+            kw_trend = df_calc.groupby(["Year", "KW"]).agg(
+                weight=("weight", "mean"),
+                date=("date", "min")
+            ).reset_index().sort_values(["Year", "KW"])
+            kw_trend["KW_Label"] = kw_trend.apply(lambda r: f"KW {int(r['KW'])}", axis=1)
+
+            chart = alt.Chart(kw_trend).mark_line(point=True, color="#e04848").encode(
+                x=alt.X("KW_Label:N", title="Calendar Week", sort=None),
+                y=alt.Y("weight:Q", scale=alt.Scale(domain=[76, 83]), title="Average Weight (kg)"),
+                tooltip=["KW_Label:N", alt.Tooltip("weight:Q", format=".2f", title="Ø Weight")]
+            ).properties(height=320)
 
         st.altair_chart(chart, use_container_width=True)
 
-    with st.expander("Full Data Log"):
-        display_df = df[["date", "weight", "kw_label"]].copy()
-        display_df["date"] = display_df["date"].dt.strftime("%Y-%m-%d")
+        # KALENDERWOCHEN TABELLE
+        st.subheader("Calendar Week (KW) Summary")
+        kw_summary = df_calc.groupby(["Year", "KW"])["weight"].agg(
+            Average="mean",
+            Min="min",
+            Max="max",
+            Entries="count"
+        ).reset_index().sort_values(["Year", "KW"], ascending=False)
+        kw_summary["Average"] = kw_summary["Average"].round(2)
+        kw_summary["Range"] = kw_summary.apply(lambda r: f"{r['Min']:.1f} - {r['Max']:.1f} kg", axis=1)
         st.dataframe(
-            display_df.sort_values("date", ascending=False).reset_index(drop=True),
-            use_container_width=True
+            kw_summary[["Year", "KW", "Average", "Range", "Entries"]],
+            use_container_width=True,
+            hide_index=True
         )
+
+
+# ====================================================
+# TAB 2: GYM & WORKOUT LOG
+# ====================================================
+with tab_gym:
+    st.header("Daily Gym Log")
+
+    EXERCISE_SPLITS = {
+        "Upper Body": [
+            "Dumbbells Bench Press",
+            "Overhead Shoulder Press Dumbbells",
+            "Seitheben",
+            "Latzug",
+            "Rudern",
+            "Butterfly Chest",
+            "Trizeps Overhead Cable Extensions",
+            "Trizeps Pushdowns",
+            "Cable Curls Bizeps",
+            "Hammer Curls",
+            "Custom"
+        ],
+        "Lower Body": [
+            "Squat",
+            "Leg Extensions Machine",
+            "Leg Curls Machine",
+            "Calves",
+            "Roll Outs (Abs)",
+            "Normal Crunches",
+            "Custom"
+        ],
+        "Weaknesses / Custom Split": [
+            "Seitheben",
+            "Cable Curls Bizeps",
+            "Hammer Curls",
+            "Roll Outs (Abs)",
+            "Calves",
+            "Custom"
+        ]
+    }
+
+    weekday_num = datetime.now().weekday()
+    default_split_idx = 0
+    if weekday_num in [0, 3]:
+        default_split_idx = 0
+    elif weekday_num in [1, 4]:
+        default_split_idx = 1
+    elif weekday_num == 5:
+        default_split_idx = 2
+
+    c_date, c_split = st.columns(2)
+    with c_date:
+        workout_date = st.date_input("Workout Date", date.today(), key="wk_date")
+    with c_split:
+        selected_split = st.selectbox(
+            "Session Focus",
+            options=list(EXERCISE_SPLITS.keys()),
+            index=default_split_idx
+        )
+
+    # Swipe Slider
+    st.markdown("##### Session Completion")
+    swipe_val = st.slider(
+        "Swipe right when session is done 👉",
+        min_value=0,
+        max_value=100,
+        value=0,
+        step=5,
+        format="%d%%"
+    )
+
+    if swipe_val >= 95:
+        st.success("🔥 Workout Completed!")
+        if st.button("Confirm & Save Workout Day"):
+            date_str = workout_date.strftime("%Y-%m-%d")
+            df_workouts_clean = df_workouts[df_workouts["date"] != date_str].copy()
+            new_workout = pd.DataFrame([{
+                "date": date_str,
+                "split_type": selected_split,
+                "completed": "TRUE"
+            }])
+            updated_workouts = pd.concat([df_workouts_clean, new_workout], ignore_index=True)
+            conn.update(worksheet="workouts", data=updated_workouts)
+            st.toast("Workout consistency logged!")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("Log Exercise Sets")
+
+    split_options = EXERCISE_SPLITS.get(selected_split, [])
+    selected_option = st.selectbox("Select Exercise", options=split_options)
+
+    # CUSTOM ÜBUNG
+    if selected_option == "Custom":
+        active_exercise = st.text_input("Name your Custom Exercise:", placeholder="e.g., Incline Dumbbell Bench")
+    else:
+        active_exercise = selected_option
+
+    # HISTORIE DER ÜBUNG (IN GRAU)
+    if active_exercise and not df_exercises.empty:
+        history_match = df_exercises[df_exercises["exercise"].astype(str).str.strip().str.lower() == active_exercise.strip().lower()].copy()
+        
+        if not history_match.empty:
+            history_match["date_dt"] = pd.to_datetime(history_match["date"])
+            sorted_dates = history_match.sort_values("date_dt", ascending=False)["date"].unique()
+
+            last_date_str = sorted_dates[0]
+            last_sets = history_match[history_match["date"] == last_date_str].sort_values("set_number")
+            summary_str = " • ".join([
+                f"Satz {r['set_number']}: {r['weight_kg']} kg × {r['reps']}"
+                for _, r in last_sets.iterrows()
+            ])
+            last_note = last_sets.iloc[-1].get("notes", "")
+            note_str = f"<br><em>Note: {last_note}</em>" if pd.notna(last_note) and str(last_note).strip() else ""
+
+            st.markdown(
+                f"""<div class="history-card">
+                    <strong>Last Session ({last_date_str}):</strong><br>
+                    {summary_str}{note_str}
+                </div>""",
+                unsafe_allow_html=True
+            )
+
+            if len(sorted_dates) > 1:
+                with st.expander("🕒 View Older Sessions"):
+                    for prev_d in sorted_dates[1:]:
+                        prev_sets = history_match[history_match["date"] == prev_d].sort_values("set_number")
+                        prev_sum = " • ".join([
+                            f"Satz {r['set_number']}: {r['weight_kg']} kg × {r['reps']}"
+                            for _, r in prev_sets.iterrows()
+                        ])
+                        p_note = prev_sets.iloc[-1].get("notes", "")
+                        p_note_str = f" — <em>{p_note}</em>" if pd.notna(p_note) and str(p_note).strip() else ""
+                        st.markdown(f"- **{prev_d}**: {prev_sum}{p_note_str}", unsafe_allow_html=True)
+        else:
+            st.caption("No previous entries found for this exercise.")
+
+    with st.form("set_form", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            set_num = st.number_input("Set #", min_value=1, max_value=12, value=1, step=1)
+        with c2:
+            weight_val = st.number_input("Weight (kg)", min_value=0.0, max_value=400.0, value=20.0, step=2.5)
+        with c3:
+            reps_val = st.number_input("Reps", min_value=1, max_value=50, value=10, step=1)
+
+        set_note = st.text_input("Notes (optional, e.g., 'Felt easy, increase weight')")
+        submit_set = st.form_submit_button("Record Set", use_container_width=True)
+
+        if submit_set:
+            if not active_exercise or not active_exercise.strip():
+                st.error("Please provide an exercise name.")
+            else:
+                date_str = workout_date.strftime("%Y-%m-%d")
+                new_log = pd.DataFrame([{
+                    "date": date_str,
+                    "exercise": active_exercise.strip(),
+                    "set_number": int(set_num),
+                    "weight_kg": float(weight_val),
+                    "reps": int(reps_val),
+                    "notes": set_note
+                }])
+                updated_ex = pd.concat([df_exercises, new_log], ignore_index=True)
+                conn.update(worksheet="exercise_logs", data=updated_ex)
+                st.success(f"Recorded Set {set_num} for {active_exercise} ({weight_val} kg × {reps_val})")
+                st.rerun()
+
+    current_date_str = workout_date.strftime("%Y-%m-%d")
+    todays_sets = df_exercises[df_exercises["date"] == current_date_str]
+    if not todays_sets.empty:
+        st.markdown("##### Logged Today")
+        st.dataframe(
+            todays_sets[["exercise", "set_number", "weight_kg", "reps", "notes"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.markdown("---")
+    st.subheader("Weekly Gym Consistency")
+    today = date.today()
+    start_of_week = today - timedelta(days=today.weekday())
+    days_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    
+    cal_cols = st.columns(7)
+    for i in range(7):
+        day_date = start_of_week + timedelta(days=i)
+        day_str = day_date.strftime("%Y-%m-%d")
+        logged_day = df_workouts[df_workouts["date"] == day_str]
+        hit_gym = not logged_day.empty and logged_day.iloc[0].get("completed") in [True, "TRUE", "True", 1]
+
+        with cal_cols[i]:
+            symbol = "✅" if hit_gym else "⚪"
+            st.markdown(f"<div style='text-align:center;'><b>{days_labels[i]}</b><br>{symbol}</div>", unsafe_allow_html=True)
